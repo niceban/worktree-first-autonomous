@@ -28,6 +28,14 @@ const hooksJson = {
       async: false
     },
     {
+      name: "pre-push",
+      event: "PreToolUse",
+      hookType: "external",
+      command: `${process.env.HOME}/.wf2-autonomous/hooks/pre-push.sh`,
+      matcher: { tool: "Bash" },
+      async: false
+    },
+    {
       name: "post-tool",
       event: "PostToolUse",
       hookType: "external",
@@ -90,8 +98,9 @@ Bash(`cp "${process.env.HOME}/.claude/hooks/hooks.json" "${projectHooksDir}/hook
 
 ## Quality Checklist
 
-- [ ] `hooks.json` 包含所有 4 个 hook 配置
+- [ ] `hooks.json` 包含所有 5 个 hook 配置
 - [ ] `hooks.json` 每个 hook 有正确的 `event` 字段
+- [ ] `pre-push` 使用 `PreToolUse` event 和 `matcher: { tool: "Bash" }`
 - [ ] `post-tool` 和 `post-tool-fail` 都有 `matcher: { tool: "Bash" }`
 - [ ] `session-start` 有 `once: true`
 - [ ] `stop` 没有 `async`（需要同步执行）

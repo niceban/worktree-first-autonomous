@@ -1,10 +1,11 @@
 # Phase 2: Generate Hook Scripts
 
-生成 4 个 hook 脚本：session-start.sh, post-tool.sh, post-tool-fail.sh, stop.sh。
+生成 5 个 hook 脚本：session-start.sh, pre-push.sh, post-tool.sh, post-tool-fail.sh, stop.sh。
 
 ## Objective
 
 - 生成 `~/.wf2-autonomous/hooks/session-start.sh`
+- 生成 `~/.wf2-autonomous/hooks/pre-push.sh`（squash-on-PUSH）
 - 生成 `~/.wf2-autonomous/hooks/post-tool.sh`
 - 生成 `~/.wf2-autonomous/hooks/post-tool-fail.sh`
 - 生成 `~/.wf2-autonomous/hooks/stop.sh`
@@ -189,7 +190,108 @@ exit 0
 Write(`${process.env.HOME}/.wf2-autonomous/hooks/post-tool-fail.sh`, postToolFail);
 ```
 
-### Step 5: Write stop.sh
+### Step 5: Write pre-push.sh
+
+```javascript
+const prePush = `#!/usr/bin/env bash
+# pre-push.sh — PreToolUse hook: intercept git push, squash commits, force-push
+# Claude Code hooks 配置: event=PreToolUse, matcher={tool:Bash}, async=false
+# exit 0 = allow command, exit 1 = deny command
+
+set -euo pipefail
+
+AUTONOMOUS_DIR="\${HOME}/.wf2-autonomous"
+STATE_FILE="\${AUTONOMOUS_DIR}/state.json"
+CONFIG_FILE="\${AUTONOMOUS_DIR}/config.json"
+
+# 读取 hook 输入（stdin）
+input=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+  input+="$line"$'\\n'
+done
+
+# 解析命令
+COMMAND=$(echo "$input" | jq -r '.command // empty' 2>/dev/null || echo "")
+[[ -z "$COMMAND" ]] && exit 0
+
+# 检查是否是 git push 命令
+if ! echo "$COMMAND" | grep -qE '^[[:space:]]*git[[:space:]]+push'; then
+  exit 0
+fi
+
+# 只在 feature 分支工作
+if [[ ! -f "$STATE_FILE" ]]; then
+  exit 0
+fi
+
+branch_type=$(jq -r '.branch_type // "feature"' "$STATE_FILE")
+milestone=$(jq -r '.milestone // false' "$STATE_FILE")
+awaiting_squash_push=$(jq -r '.awaiting_squash_push // false' "$STATE_FILE")
+
+[[ "$branch_type" != "feature" ]] && exit 0
+[[ "$milestone" != "true" && "$awaiting_squash_push" != "true" ]] && exit 0
+
+# 检查是否有 commits 需要 squash（至少 2 个 commits 相对于 main）
+commits_to_push=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+if [[ "$commits_to_push" -lt 2 ]]; then
+  exit 0
+fi
+
+echo "[pre-push] squash-on-push triggered: $commits_to_push commits → 1 commit"
+
+# 执行 non-interactive squash: git reset --soft
+current_branch=$(git symbolic-ref --short HEAD 2>/dev/null || echo "feature")
+first_commit=$(git rev-list --max-parents=0 HEAD 2>/dev/null | tail -1)
+base_commit=$(git merge-base HEAD origin/main 2>/dev/null || echo "$first_commit")
+
+# 获取所有 commit messages 用于生成 squash message
+squash_msg=""
+if [[ -n "$first_commit" && "$first_commit" != "$base_commit" ]]; then
+  squash_msg=$(git log --format="%s" "$base_commit"..HEAD 2>/dev/null | head -20 | paste -sd ' | ' || echo "squash: $current_branch commits")
+else
+  squash_msg=$(git log --format="%s" -10 HEAD 2>/dev/null | paste -sd ' | ' || echo "squash: $current_branch")
+fi
+
+echo "[pre-push] squashing: $squash_msg"
+
+# 执行 soft reset 到 origin/main，保留所有更改在 staging
+if ! git reset --soft origin/main 2>/dev/null; then
+  echo "[pre-push] reset failed, allowing normal push"
+  exit 0
+fi
+
+# 创建 squash commit
+final_msg="squash(${current_branch}): ${squash_msg}"
+if ! git commit -m "$final_msg" 2>/dev/null; then
+  echo "[pre-push] commit failed, allowing normal push"
+  git reset --hard HEAD 2>/dev/null || true
+  exit 0
+fi
+
+# Force push with lease（安全 force push）
+if git push --force-with-lease origin "$current_branch" 2>/dev/null; then
+  echo "[pre-push] squashed commit pushed successfully"
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  jq \\
+    --arg now "$now" \\
+    --arg msg "$final_msg" \\
+    --arg reason "squash-on-push completed" \\
+    '.milestone = false | .milestone_reason = null | .awaiting_squash_push = false | .last_commit_at = $now | .last_commit_message = $msg' \\
+    "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
+  echo "[pre-push] state updated: milestone cleared"
+else
+  echo "[pre-push] force-push failed"
+  git reset --hard HEAD 2>/dev/null || true
+  exit 0
+fi
+
+exit 0
+`;
+
+Write(`${process.env.HOME}/.wf2-autonomous/hooks/pre-push.sh`, prePush);
+```
+
+### Step 6: Write stop.sh
 
 ```javascript
 // stop.sh — 从 IMPLEMENTATION.md 复制完整代码
@@ -311,7 +413,7 @@ if [[ "$uncommitted_files" -gt "$UNCOMMITTED_FILES_THRESHOLD" ]] || [[ "$uncommi
 fi
 
 # =====================================================================
-# Milestone 检测 + AskUser Merge
+# Milestone 检测 + squash-on-PUSH 触发
 # =====================================================================
 commits_since_tag=$(git rev-list --count HEAD ^$(git describe --tags --abbrev=0 2>/dev/null) 2>/dev/null || echo 0)
 last_commit_msg=$(git log -1 --format="%s" 2>/dev/null || echo "")
@@ -335,21 +437,20 @@ if [[ "$milestone_detected" == "true" ]] && [[ "$test_passed" == "true" ]]; then
     '.milestone = true | .milestone_reason = $reason' \\
     "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
 
-  if git rev-list --count origin/main..HEAD 2>/dev/null | grep -qE '[1-9]'; then
-    jq '.awaiting_merge_confirmation = true' "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
-
+  commits_to_push=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+  if [[ "$commits_to_push" -ge 1 ]]; then
     echo ""
     echo "=== Milestone Reached ==="
     echo "Reason: $milestone_reason"
     echo "Tests: PASSED"
-    echo "Commits to merge:"
-    git log --oneline origin/main..HEAD 2>/dev/null | head -5
+    echo "Commits to push: $commits_to_push"
+    git log --oneline origin/main..HEAD 2>/dev/null | head -10
     echo ""
-    echo "AskUser: 要合并到 main 分支吗？"
-    echo "  - 是：合并并删除 feature 分支"
-    echo "  - 否：继续开发"
+    echo "下次 'git push' 时将自动 squash 为 1 个 commit 并 force-push"
+    echo ""
 
-    exit 2  # Block session，等待用户确认
+    jq '.awaiting_squash_push = true' "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
+    echo "[stop] squash-on-push armed: next push will squash commits"
   fi
 fi
 
@@ -360,7 +461,7 @@ exit 0
 Write(`${process.env.HOME}/.wf2-autonomous/hooks/stop.sh`, stopSh);
 ```
 
-### Step 6: Set Executable Permissions
+### Step 7: Set Executable Permissions
 
 ```javascript
 Bash(`chmod +x "${process.env.HOME}/.wf2-autonomous/hooks/"*.sh`);
@@ -369,6 +470,7 @@ Bash(`chmod +x "${process.env.HOME}/.wf2-autonomous/hooks/"*.sh`);
 ## Output
 
 - **File**: `~/.wf2-autonomous/hooks/session-start.sh`
+- **File**: `~/.wf2-autonomous/hooks/pre-push.sh`（squash-on-PUSH 核心）
 - **File**: `~/.wf2-autonomous/hooks/post-tool.sh`
 - **File**: `~/.wf2-autonomous/hooks/post-tool-fail.sh`
 - **File**: `~/.wf2-autonomous/hooks/stop.sh`
@@ -376,12 +478,15 @@ Bash(`chmod +x "${process.env.HOME}/.wf2-autonomous/hooks/"*.sh`);
 
 ## Quality Checklist
 
-- [ ] 所有 4 个 hook 脚本存在
+- [ ] 所有 5 个 hook 脚本存在
 - [ ] 所有脚本有可执行权限
 - [ ] session-start.sh 包含 `set -euo pipefail`
 - [ ] post-tool.sh 正确处理无 newline 的 stdin（async hook bug workaround）
 - [ ] stop.sh 输出小于 64KB（避免 pipe buffer deadlock）
-- [ ] stop.sh 包含 `exit 2` 的 block 逻辑
+- [ ] pre-push.sh 正确检测 git push 命令
+- [ ] pre-push.sh 使用 `git reset --soft` 实现 non-interactive squash
+- [ ] pre-push.sh 使用 `--force-with-lease` 安全 force push
+- [ ] stop.sh milestone 检测后设置 `awaiting_squash_push = true`
 
 ## Next Phase
 
