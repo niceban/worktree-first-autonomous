@@ -335,7 +335,7 @@ if [[ "$milestone_detected" == "true" ]] && [[ "$test_passed" == "true" ]]; then
     '.milestone = true | .milestone_reason = $reason' \\
     "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
 
-  if git log --oneline origin/main..HEAD 2>/dev/null | grep -q .; then
+  if git rev-list --count origin/main..HEAD 2>/dev/null | grep -qE '[1-9]'; then
     jq '.awaiting_merge_confirmation = true' "$STATE_FILE" > "\${STATE_FILE}.tmp" && mv "\${STATE_FILE}.tmp" "$STATE_FILE"
 
     echo ""
