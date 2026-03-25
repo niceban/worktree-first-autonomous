@@ -40,6 +40,8 @@ const state = {
   last_commit_message: null,
   milestone: false,
   milestone_reason: null,
+  awaiting_squash_confirmation: false,
+  squash_requested: false,
   awaiting_merge_confirmation: false,
   awaiting_release_confirmation: false,
   commits_since_last_tag: 0,
